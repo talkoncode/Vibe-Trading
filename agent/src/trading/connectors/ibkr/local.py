@@ -287,26 +287,49 @@ def get_positions(config: IBKRLocalConfig | None = None) -> dict[str, Any]:
     try:
         accounts = _managed_accounts(ib)
         _assert_profile(cfg, accounts)
-        rows = []
-        for item in _call(ib, "positions"):
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in _current_positions(ib):
             account = str(_obj_get(item, "account", ""))
             if cfg.account and account and account != cfg.account:
                 continue
             contract = _obj_get(item, "contract")
-            rows.append(
-                {
-                    "account": account,
-                    "symbol": _obj_get(contract, "symbol"),
-                    "local_symbol": _obj_get(contract, "localSymbol"),
-                    "sec_type": _obj_get(contract, "secType"),
-                    "exchange": _obj_get(contract, "exchange"),
-                    "currency": _obj_get(contract, "currency"),
-                    "con_id": _obj_get(contract, "conId"),
-                    "position": _obj_get(item, "position"),
-                    "avg_cost": _obj_get(item, "avgCost"),
-                }
+            position = _obj_get(item, "position")
+            try:
+                if float(position or 0) == 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            contract_type = str(_obj_get(contract, "secType") or "").upper()
+            row = {
+                "account": account,
+                "symbol": _obj_get(contract, "symbol"),
+                "local_symbol": _obj_get(contract, "localSymbol"),
+                "sec_type": contract_type,
+                "exchange": _obj_get(contract, "exchange"),
+                "currency": _obj_get(contract, "currency"),
+                "con_id": _obj_get(contract, "conId"),
+                "contract_id": _obj_get(contract, "conId"),
+                "last_trade_date_or_contract_month": _obj_get(
+                    contract, "lastTradeDateOrContractMonth"
+                ),
+                "strike": _obj_get(contract, "strike"),
+                "right": _obj_get(contract, "right"),
+                "multiplier": _obj_get(contract, "multiplier"),
+                "trading_class": _obj_get(contract, "tradingClass"),
+                "position": position,
+                "avg_cost": _obj_get(item, "avgCost"),
+                "avg_cost_includes_multiplier": contract_type in {"OPT", "FOP"},
+            }
+            key = (
+                account,
+                str(
+                    row["contract_id"]
+                    or row["local_symbol"]
+                    or f"{row['symbol']}-{row['sec_type']}"
+                ),
             )
-        return {"status": "ok", "profile": cfg.profile, "positions": rows}
+            rows[key] = row
+        return {"status": "ok", "profile": cfg.profile, "positions": list(rows.values())}
     finally:
         _pool.release()
 
@@ -424,14 +447,36 @@ def get_quote(
     exchange: str = "SMART",
     currency: str = "USD",
     sec_type: str = "STK",
+    contract_id: int | str | None = None,
+    local_symbol: str | None = None,
+    last_trade_date_or_contract_month: str | None = None,
+    strike: float | str | None = None,
+    right: str | None = None,
+    multiplier: str | int | None = None,
 ) -> dict[str, Any]:
-    """Fetch a top-of-book quote snapshot."""
+    """Fetch a top-of-book quote snapshot.
+
+    Options must pass ``sec_type="OPT"`` plus the contract identity (``conId``
+    or expiry/strike/right). Forwarding the underlying symbol alone would
+    price the stock instead of the option, so those fields go to TWS as-is.
+    """
     cfg = config or load_config()
     ib = _pool.acquire(cfg)
     try:
         accounts = _managed_accounts(ib)
         _assert_profile(cfg, accounts)
-        contract = _make_contract(symbol, exchange=exchange, currency=currency, sec_type=sec_type)
+        contract = _make_contract(
+            symbol,
+            exchange=exchange,
+            currency=currency,
+            sec_type=sec_type,
+            contract_id=contract_id,
+            local_symbol=local_symbol,
+            last_trade_date_or_contract_month=last_trade_date_or_contract_month,
+            strike=strike,
+            right=right,
+            multiplier=multiplier,
+        )
         _qualify_contract(ib, contract)
         tier_unapplied = _apply_market_data_type(ib, cfg)
         ticker = ib.reqMktData(contract, "", True, False)
@@ -637,17 +682,48 @@ def _assert_profile(config: IBKRLocalConfig, accounts: Iterable[str]) -> None:
         )
 
 
-def _make_contract(symbol: str, *, exchange: str, currency: str, sec_type: str) -> Any:
+def _make_contract(
+    symbol: str,
+    *,
+    exchange: str,
+    currency: str,
+    sec_type: str,
+    contract_id: int | str | None = None,
+    local_symbol: str | None = None,
+    last_trade_date_or_contract_month: str | None = None,
+    strike: float | str | None = None,
+    right: str | None = None,
+    multiplier: str | int | None = None,
+) -> Any:
     module = _require_ib_async()
     clean_symbol = symbol.strip().upper()
     clean_type = sec_type.strip().upper()
-    if clean_type == "STK" and hasattr(module, "Stock"):
+    if (
+        clean_type == "STK"
+        and hasattr(module, "Stock")
+        and not contract_id
+        and not local_symbol
+    ):
         return module.Stock(clean_symbol, exchange, currency)
     contract = module.Contract()
+    if contract_id not in (None, "", 0, "0"):
+        contract.conId = int(contract_id)
+    if local_symbol:
+        contract.localSymbol = str(local_symbol).strip()
     contract.symbol = clean_symbol
     contract.secType = clean_type
     contract.exchange = exchange
     contract.currency = currency
+    if clean_type in {"OPT", "FOP"}:
+        expiry = str(last_trade_date_or_contract_month or "").strip()
+        if expiry:
+            contract.lastTradeDateOrContractMonth = expiry
+        if strike not in (None, ""):
+            contract.strike = float(strike)
+        if right:
+            contract.right = str(right).strip().upper()
+        if multiplier not in (None, ""):
+            contract.multiplier = str(multiplier).strip()
     return contract
 
 
@@ -671,6 +747,20 @@ def _sleep(ib: Any, seconds: float) -> None:
 
 def _call(obj: Any, name: str) -> Any:
     return getattr(obj, name)()
+
+
+def _current_positions(ib: Any) -> list[Any]:
+    """Return a fresh position snapshot instead of ib_async's event cache.
+
+    ``IB.positions()`` only replays position events accumulated on this
+    socket. A long-lived connection can therefore keep contracts that TWS no
+    longer reports. ``reqPositions()`` asks TWS again and returns exactly the
+    rows received for that request.
+    """
+    request = getattr(ib, "reqPositions", None)
+    if callable(request):
+        return list(request() or [])
+    return list(_call(ib, "positions"))
 
 
 def _safe_call(obj: Any, name: str) -> Any:
@@ -787,6 +877,12 @@ def _contract_to_dict(contract: Any) -> dict[str, Any]:
         "exchange": _obj_get(contract, "exchange"),
         "currency": _obj_get(contract, "currency"),
         "con_id": _obj_get(contract, "conId"),
+        "last_trade_date_or_contract_month": _obj_get(
+            contract, "lastTradeDateOrContractMonth"
+        ),
+        "strike": _obj_get(contract, "strike"),
+        "right": _obj_get(contract, "right"),
+        "multiplier": _obj_get(contract, "multiplier"),
     }
 
 

@@ -24,6 +24,10 @@ class _FakeContract:
         self.currency = ""
         self.conId = 0
         self.localSymbol = ""
+        self.lastTradeDateOrContractMonth = ""
+        self.strike = 0.0
+        self.right = ""
+        self.multiplier = ""
 
 
 class _FakeStock(_FakeContract):
@@ -128,6 +132,128 @@ def test_positions_are_serialized(fake_ib_async) -> None:
 
     assert result["positions"][0]["symbol"] == "AAPL"
     assert result["positions"][0]["position"] == 3
+
+
+def test_positions_use_fresh_request_and_drop_closed_rows(fake_ib_async, monkeypatch) -> None:
+    def cached(_self):
+        return [
+            SimpleNamespace(
+                account="DU12345",
+                contract=SimpleNamespace(
+                    symbol="CRWV",
+                    localSymbol="CRWV",
+                    secType="OPT",
+                    exchange="SMART",
+                    currency="USD",
+                    conId=870611238,
+                ),
+                position=-2,
+                avgCost=176.31305,
+            )
+        ]
+
+    def fresh(_self):
+        return [
+            SimpleNamespace(
+                account="DU12345",
+                contract=SimpleNamespace(
+                    symbol="AAPL",
+                    localSymbol="AAPL",
+                    secType="STK",
+                    exchange="SMART",
+                    currency="USD",
+                    conId=265598,
+                ),
+                position=3,
+                avgCost=150.0,
+            ),
+            SimpleNamespace(
+                account="DU12345",
+                contract=SimpleNamespace(
+                    symbol="CRWV",
+                    localSymbol="CRWV",
+                    secType="OPT",
+                    exchange="SMART",
+                    currency="USD",
+                    conId=870611238,
+                ),
+                position=0,
+                avgCost=176.31305,
+            ),
+        ]
+
+    monkeypatch.setattr(_FakeIB, "positions", cached)
+    monkeypatch.setattr(_FakeIB, "reqPositions", fresh, raising=False)
+
+    result = local.get_positions(local.IBKRLocalConfig())
+
+    assert [(row["symbol"], row["position"]) for row in result["positions"]] == [
+        ("AAPL", 3)
+    ]
+
+
+def test_option_positions_keep_contract_identity(fake_ib_async, monkeypatch) -> None:
+    def positions(_self):
+        contract = SimpleNamespace(
+            symbol="AAPL",
+            localSymbol="AAPL  260116C00200000",
+            secType="OPT",
+            exchange="SMART",
+            currency="USD",
+            conId=123456,
+            lastTradeDateOrContractMonth="20260116",
+            strike=200.0,
+            right="C",
+            multiplier="100",
+        )
+        return [SimpleNamespace(account="DU12345", contract=contract, position=2, avgCost=3.5)]
+
+    monkeypatch.setattr(_FakeIB, "positions", positions)
+    row = local.get_positions(local.IBKRLocalConfig())["positions"][0]
+
+    assert row["contract_id"] == 123456
+    assert row["last_trade_date_or_contract_month"] == "20260116"
+    assert row["strike"] == 200.0
+    assert row["right"] == "C"
+    assert row["multiplier"] == "100"
+    assert row["avg_cost_includes_multiplier"] is True
+
+
+def test_option_quote_forwards_contract_fields(fake_ib_async, monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def req_mkt_data(_self, contract, *_args):
+        seen.update(
+            con_id=contract.conId,
+            sec_type=contract.secType,
+            expiry=contract.lastTradeDateOrContractMonth,
+            strike=contract.strike,
+            right=contract.right,
+            multiplier=contract.multiplier,
+        )
+        return SimpleNamespace(bid=1.0, ask=1.2, last=1.1, close=1.0, volume=10, time="")
+
+    monkeypatch.setattr(_FakeIB, "reqMktData", req_mkt_data)
+    result = local.get_quote(
+        "AAPL",
+        config=local.IBKRLocalConfig(profile="paper"),
+        sec_type="OPT",
+        contract_id=123456,
+        last_trade_date_or_contract_month="20260116",
+        strike=200,
+        right="C",
+        multiplier="100",
+    )
+
+    assert result["status"] == "ok"
+    assert seen == {
+        "con_id": 123456,
+        "sec_type": "OPT",
+        "expiry": "20260116",
+        "strike": 200.0,
+        "right": "C",
+        "multiplier": "100",
+    }
 
 
 def test_quote_and_history_are_readonly(fake_ib_async) -> None:

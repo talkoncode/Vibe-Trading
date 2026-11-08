@@ -17,6 +17,16 @@ RUN npm run build
 FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3 AS builder
 # python:3.11-slim digest resolved 2026-07-13
 
+# Optional Debian mirror (e.g. mirrors.tuna.tsinghua.edu.cn) for networks where
+# deb.debian.org is slow or unreachable. Defaults to the stock upstream.
+ARG APT_MIRROR=deb.debian.org
+RUN set -e; \
+    if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+            if [ -f "$f" ]; then sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; fi; \
+        done; \
+    fi
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -25,6 +35,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Optional PyPI index (e.g. https://pypi.tuna.tsinghua.edu.cn/simple).
+# Hashes from requirements-lock.txt are still enforced against the mirror.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+# PyPI can be slow on some networks; the default 15s socket timeout aborts the
+# build with a pip traceback. Give downloads more headroom and retry transient
+# read timeouts instead of failing the whole image build.
+ENV PIP_DEFAULT_TIMEOUT=180 \
+    PIP_RETRIES=10 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL}
 
 WORKDIR /app
 
@@ -53,11 +75,33 @@ COPY pyproject.toml LICENSE README.md ./
 COPY agent/ agent/
 RUN pip install --no-cache-dir --no-deps -e .
 
+# Optional broker SDK extras, e.g. "ibkr,longbridge". Empty by default so the
+# stock image stays lean; set --build-arg INSTALL_BROKER_EXTRAS=ibkr,longbridge
+# (or INSTALL_BROKER_EXTRAS=ibkr,longbridge in a root .env).
+ARG INSTALL_BROKER_EXTRAS=""
+# Connector SDKs that are not packaged as extras (futu-api, tigeropen,
+# python-okx, alpaca-py, dhanhq, ...). Space-separated pip requirements.
+ARG INSTALL_BROKER_PACKAGES=""
+RUN if [ -n "$INSTALL_BROKER_EXTRAS" ]; then \
+        pip install --no-cache-dir "vibe-trading-ai[$INSTALL_BROKER_EXTRAS]"; \
+    fi; \
+    if [ -n "$INSTALL_BROKER_PACKAGES" ]; then \
+        pip install --no-cache-dir $INSTALL_BROKER_PACKAGES; \
+    fi
+
 # ============================================================================
 # Stage 3: Runtime — carries the prebuilt venv only, no compilers/dev headers.
 # ============================================================================
 FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3 AS runtime
 # python:3.11-slim digest resolved 2026-07-13
+
+ARG APT_MIRROR=deb.debian.org
+RUN set -e; \
+    if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+            if [ -f "$f" ]; then sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; fi; \
+        done; \
+    fi
 
 LABEL org.opencontainers.image.title="Vibe-Trading" \
     org.opencontainers.image.description="Natural-language finance research AI agent with backtesting" \

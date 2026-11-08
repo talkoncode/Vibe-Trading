@@ -50,7 +50,10 @@ _RISK_XRAY_MAX_SYMBOLS = 50
 # USD/HKD/CNY snapshots whose numeric values would otherwise remain valid.
 # Version 4 rebuilds persisted holdings after market-prefix normalization;
 # old snapshots may have split one instrument into separate broker holdings.
-PORTFOLIO_VALUATION_VERSION = 4
+# Version 5 corrects IBKR option cost basis: avgCost is contract-level while
+# option quotes are per share. Snapshots from older versions can contain the
+# wrong sign and magnitude for option P&L, so they stay hidden.
+PORTFOLIO_VALUATION_VERSION = 5
 _LOADER_MARKET_SUFFIXES = frozenset({"US", "HK", "SZ", "SH", "BJ", "KS", "KQ", "NS", "BO", "TO", "V"})
 _NON_EQUITY_ASSET_TYPES = frozenset({"crypto", "stablecoin", "cash"})
 # Futu reports codes market-first (``HK.00700``, ``US.AAPL``); the rest of the
@@ -1074,12 +1077,26 @@ class PortfolioService:
                     normalized["price_error"] = f"{broker} quotes are not mapped for this connection"
                 else:
                     quote_symbol = normalized["quote_symbol"]
+                    quote_sec_type = (
+                        "OPT" if normalized.get("asset_type") == "option" else "STK"
+                    )
+                    option_contract: dict[str, Any] = {}
+                    if broker == "ibkr" and quote_sec_type == "OPT":
+                        option_contract = {
+                            "contract_id": normalized.get("contract_id"),
+                            "local_symbol": normalized.get("local_symbol"),
+                            "last_trade_date_or_contract_month": normalized.get("expiry"),
+                            "strike": normalized.get("strike"),
+                            "right": normalized.get("right"),
+                            "multiplier": normalized.get("contract_multiplier"),
+                        }
                     quote = self._get_quote(
                         quote_symbol,
                         profile_id,
                         exchange=normalized.get("exchange") or "SMART",
                         currency=normalized["currency"],
-                        sec_type="STK",
+                        sec_type=quote_sec_type,
+                        **option_contract,
                         # Same rule as the reads above: a dashboard refresh
                         # must never open a browser (reconnect_source() is the
                         # one explicit interactive path).

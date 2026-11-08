@@ -331,6 +331,12 @@ def get_quote(
     exchange: str = "SMART",
     currency: str = "USD",
     sec_type: str = "STK",
+    contract_id: int | str | None = None,
+    local_symbol: str | None = None,
+    last_trade_date_or_contract_month: str | None = None,
+    strike: float | str | None = None,
+    right: str | None = None,
+    multiplier: str | int | None = None,
     **overrides: Any,
 ) -> dict[str, Any]:
     """Read a quote for a connector profile.
@@ -341,6 +347,12 @@ def get_quote(
         exchange: IBKR exchange, ignored off the local TWS transport.
         currency: Quote currency, ignored off the local TWS transport.
         sec_type: IBKR security type, ignored off the local TWS transport.
+        contract_id: IBKR conId, used to resolve an option contract exactly.
+        local_symbol: IBKR localSymbol (OSI option symbol when present).
+        last_trade_date_or_contract_month: IBKR option expiry (YYYYMMDD).
+        strike: IBKR option strike.
+        right: IBKR option right (``C`` or ``P``).
+        multiplier: IBKR contract multiplier (``100`` for equity options).
         **overrides: ``interactive_oauth=False`` keeps an expired grant from
             opening a browser, matching the other remote MCP reads.
     """
@@ -356,6 +368,12 @@ def get_quote(
                 exchange=exchange,
                 currency=currency,
                 sec_type=sec_type,
+                contract_id=contract_id,
+                local_symbol=local_symbol,
+                last_trade_date_or_contract_month=last_trade_date_or_contract_month,
+                strike=strike,
+                right=right,
+                multiplier=multiplier,
             ),
         )
     if profile.transport == "broker_sdk":

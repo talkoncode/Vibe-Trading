@@ -68,24 +68,60 @@ def normalize_position(broker: str, row: dict[str, Any]) -> dict[str, Any]:
     if broker == "ibkr":
         symbol = str(row.get("symbol") or row.get("local_symbol") or "").upper()
         sec_type = str(row.get("sec_type") or "STK").upper()
+        is_option = sec_type in {"OPT", "FOP"}
         market_price = _decimal(row.get("market_price", row.get("current_price")))
-        return {
+        expiry = str(row.get("last_trade_date_or_contract_month") or "").strip()
+        strike = _decimal(row.get("strike"))
+        right = str(row.get("right") or "").strip().upper()
+        multiplier = _decimal(row.get("multiplier"))
+        if is_option and multiplier <= 0:
+            multiplier = Decimal("100")
+        cost = _decimal(row.get("avg_cost", row.get("average_cost")))
+        if (
+            is_option
+            and multiplier > 0
+            and bool(row.get("avg_cost_includes_multiplier"))
+        ):
+            # Local TWS reports an option position's avgCost per contract
+            # (already multiplied by the contract multiplier), while its
+            # market price is quoted per share. Convert once here so later
+            # valuation uses one consistent per-share cost basis.
+            cost /= multiplier
+        normalized = {
             "broker": broker,
             "symbol": symbol,
             "quote_symbol": symbol,
-            "name": symbol,
-            "asset_type": "etf" if sec_type == "ETF" else "stock",
+            "name": _option_display_name(symbol, expiry, strike, right)
+            if is_option
+            else symbol,
+            "asset_type": "option" if is_option else "etf" if sec_type == "ETF" else "stock",
             "market": str(row.get("exchange") or ""),
             "exchange": row.get("exchange"),
             "currency": str(row.get("currency") or "USD").upper(),
             "quantity": _number(_decimal(row.get("position", row.get("quantity")))),
-            "cost_price": _number(_decimal(row.get("avg_cost", row.get("average_cost")))),
+            "cost_price": _number(cost),
             "market_price": _number(market_price) if market_price > 0 else None,
             "source_market_value": row.get("market_value"),
             "source_unrealized_pnl": row.get("unrealized_pnl"),
-            "contract_id": row.get("contract_id"),
+            "contract_id": row.get("contract_id", row.get("con_id")),
             "updated_at": _now(),
         }
+        if is_option:
+            normalized.update(
+                expiry=expiry or None,
+                strike=_number(strike) if strike > 0 else None,
+                right=right or None,
+                contract_multiplier=_number(multiplier),
+                local_symbol=row.get("local_symbol"),
+                instrument_id_kind="option",
+                instrument_id=str(
+                    row.get("contract_id")
+                    or row.get("con_id")
+                    or row.get("local_symbol")
+                    or f"{symbol}-{expiry}-{strike}-{right}"
+                ),
+            )
+        return normalized
     if broker == "longbridge":
         symbol = str(row.get("symbol") or "").upper()
         market = str(row.get("market") or symbol.rsplit(".", 1)[-1]).upper()
@@ -212,15 +248,22 @@ def value_position(row: dict[str, Any], *, rates: Rates) -> dict[str, Any]:
     """
     price = _decimal(row.get("market_price"))
     quantity = _decimal(row.get("quantity"))
+    multiplier = _decimal(row.get("contract_multiplier"))
+    if multiplier <= 0:
+        multiplier = Decimal("1")
     currency = str(row.get("price_currency") or row.get("currency") or "USD").upper()
     priced = price > 0
-    market_usd = to_usd(quantity * price, currency, rates) if priced else Decimal("0")
+    market_usd = (
+        to_usd(quantity * price * multiplier, currency, rates)
+        if priced
+        else Decimal("0")
+    )
     cost = _decimal(row.get("cost_price"))
     source_pnl = row.get("source_unrealized_pnl")
     pnl_usd = (
         to_usd(_decimal(source_pnl), currency, rates)
         if priced and source_pnl is not None
-        else to_usd((price - cost) * quantity, currency, rates)
+        else to_usd((price - cost) * quantity * multiplier, currency, rates)
         if priced and cost > 0
         else None
     )
@@ -239,6 +282,22 @@ def value_position(row: dict[str, Any], *, rates: Rates) -> dict[str, Any]:
     ):
         row.pop(key, None)
     return row
+
+
+def _option_display_name(
+    symbol: str, expiry: str, strike: Decimal, right: str
+) -> str:
+    """Render an option contract label for the holdings table."""
+    expiry_text = expiry
+    if len(expiry_text) == 8 and expiry_text.isdigit():
+        expiry_text = f"{expiry_text[:4]}-{expiry_text[4:6]}-{expiry_text[6:]}"
+    right_text = {"C": "Call", "P": "Put"}.get(right, right)
+    parts = [symbol, expiry_text]
+    if strike > 0:
+        parts.append(f"{_number(strike):g}")
+    if right_text:
+        parts.append(right_text)
+    return " ".join(part for part in parts if part)
 
 
 def _to_usd(value: Decimal, currency: str, rates: Rates) -> Decimal:

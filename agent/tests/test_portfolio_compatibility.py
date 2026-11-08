@@ -11,7 +11,7 @@ from src.portfolio.compatibility import (
     profile_compatibility,
 )
 from src.portfolio.config import eligible_profiles
-from src.portfolio.normalization import normalize_position
+from src.portfolio.normalization import normalize_position, value_position
 from src.trading.types import TradingProfile
 
 
@@ -197,3 +197,82 @@ def test_generic_normalizer_accepts_builtin_connector_aliases(connector, raw, ex
         row["cost_price"],
         row["market_price"],
     ) == expected
+
+
+def test_ibkr_option_position_keeps_contract_terms_and_multiplier() -> None:
+    row = normalize_position(
+        "ibkr",
+        {
+            "symbol": "AAPL",
+            "local_symbol": "AAPL  260116C00200000",
+            "sec_type": "OPT",
+            "exchange": "SMART",
+            "currency": "USD",
+            "con_id": 123456,
+            "last_trade_date_or_contract_month": "20260116",
+            "strike": 200.0,
+            "right": "C",
+            "multiplier": "100",
+            "position": 2,
+            "avg_cost": 250.0,
+            "avg_cost_includes_multiplier": True,
+            "market_price": 4.0,
+        },
+    )
+
+    assert row["asset_type"] == "option"
+    assert row["name"] == "AAPL 2026-01-16 200 Call"
+    assert row["cost_price"] == pytest.approx(2.5)
+    assert row["contract_multiplier"] == 100.0
+    assert row["instrument_id_kind"] == "option"
+    assert row["instrument_id"] == "123456"
+
+    valued = value_position(
+        row, rates={"USD": Decimal("1"), "CNY": Decimal("7"), "HKD": Decimal("8")}
+    )
+    assert valued["market_value_usd"] == pytest.approx(2 * 4.0 * 100)
+    assert valued["unrealized_pnl_usd"] == pytest.approx((4.0 - 2.5) * 2 * 100)
+
+
+def test_ibkr_short_option_uses_contract_cost_without_double_multiplier() -> None:
+    row = normalize_position(
+        "ibkr",
+        {
+            "symbol": "CRWV",
+            "sec_type": "OPT",
+            "currency": "USD",
+            "contract_id": 870611238,
+            "last_trade_date_or_contract_month": "20261120",
+            "strike": 47.5,
+            "right": "P",
+            "multiplier": "100",
+            "position": -2,
+            "avg_cost": 176.31305,
+            "avg_cost_includes_multiplier": True,
+            "market_price": 8.11,
+        },
+    )
+
+    assert row["cost_price"] == pytest.approx(1.7631305)
+    valued = value_position(
+        row, rates={"USD": Decimal("1"), "CNY": Decimal("7"), "HKD": Decimal("8")}
+    )
+    assert valued["unrealized_pnl_usd"] == pytest.approx((8.11 - 1.7631305) * -2 * 100)
+
+
+def test_ibkr_option_without_local_cost_marker_stays_per_share() -> None:
+    row = normalize_position(
+        "ibkr",
+        {
+            "symbol": "AAPL",
+            "sec_type": "OPT",
+            "currency": "USD",
+            "contract_id": 123456,
+            "multiplier": "100",
+            "position": 2,
+            "avg_cost": 2.5,
+            "market_price": 4.0,
+        },
+    )
+
+    assert row["cost_price"] == pytest.approx(2.5)

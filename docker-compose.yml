@@ -1,6 +1,16 @@
 services:
   vibe-trading:
-    build: .
+    image: vibe-trading:local
+    build:
+      context: .
+      args:
+        # Override in a root .env (or shell) on networks where the upstream
+        # Debian/PyPI hosts are slow: e.g. APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+        # and PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple.
+        APT_MIRROR: ${APT_MIRROR:-deb.debian.org}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        INSTALL_BROKER_EXTRAS: ${INSTALL_BROKER_EXTRAS:-}
+        INSTALL_BROKER_PACKAGES: ${INSTALL_BROKER_PACKAGES:-}
     ports:
       - "127.0.0.1:8899:8899"
     env_file:
